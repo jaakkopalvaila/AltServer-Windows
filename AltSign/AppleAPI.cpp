@@ -113,6 +113,10 @@ AppleAPI::AppleAPI() : _servicesClient(U("https://developerservices2.apple.com/s
 {
 	http_client_config config;
 	config.set_validate_certificates(false);
+	// NOTE: this vendored cpprestsdk's http_client_config has no set_keep_alive();
+	// avoiding connection reuse for GSA requests is instead handled by gsaClient()
+	// below, which hands out a brand new http_client (and thus a brand new
+	// connection pool/socket) on every call.
 
 	_gsaClient = web::http::client::http_client(U("https://gsa.apple.com"), config);
 
@@ -1012,5 +1016,14 @@ web::http::client::http_client AppleAPI::client()
 
 web::http::client::http_client AppleAPI::gsaClient()
 {
-	return this->_gsaClient;
+	// Apple's GSA endpoint returns 503 for requests sent over a reused
+	// (keep-alive) TCP connection, so build a brand new client (and thus a
+	// brand new connection pool/socket) for every GSA request instead of
+	// reusing the cached _gsaClient member. (This vendored cpprestsdk has no
+	// http_client_config::set_keep_alive(), so a fresh client/connection per
+	// call is how we avoid connection reuse here.)
+	http_client_config config;
+	config.set_validate_certificates(false);
+
+	return web::http::client::http_client(U("https://gsa.apple.com"), config);
 }

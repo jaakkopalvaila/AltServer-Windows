@@ -964,7 +964,7 @@ pplx::task<plist_t> AppleAPI::SendAuthenticationRequest(std::map<std::string, pl
 		{L"Content-Type", L"text/x-xml-plist"},
 		{L"X-Mme-Client-Info", WideStringFromString(anisetteData->deviceDescription())},
 		{L"Accept", L"*/*"},
-		{L"User-Agent", L"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"}
+		{L"User-Agent", L"AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)"}
 	};
 
 	uri_builder builder(U("/grandslam/GsService2"));
