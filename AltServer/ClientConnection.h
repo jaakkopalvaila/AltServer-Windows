@@ -27,6 +27,7 @@ public:
 	pplx::task<void> ProcessRemoveProfilesRequest(web::json::value request);
 	pplx::task<void> ProcessRemoveAppRequest(web::json::value request);
     pplx::task<void> ProcessEnableUnsignedCodeExecutionRequest(web::json::value request);
+    pplx::task<void> ProcessPairingFileRequest(web::json::value request);
 
 	pplx::task<void> SendResponse(web::json::value json);
 	pplx::task<web::json::value> ReceiveRequest();

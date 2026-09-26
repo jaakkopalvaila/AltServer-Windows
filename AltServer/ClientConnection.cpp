@@ -10,6 +10,7 @@
 #include "AnisetteDataManager.h"
 #include "AnisetteData.h"
 #include "AltServerApp.h"
+#include "DevicePairingManager.h"
 
 #include "ServerError.hpp"
 
@@ -81,6 +82,10 @@ pplx::task<void> ClientConnection::ProcessAppRequest()
         else if (identifier == "EnableUnsignedCodeExecutionRequest")
         {
             return this->ProcessEnableUnsignedCodeExecutionRequest(request);
+        }
+        else if (identifier == "PairingFileRequest")
+        {
+            return this->ProcessPairingFileRequest(request);
         }
 		else
 		{
@@ -397,6 +402,29 @@ pplx::task<void> ClientConnection::ProcessEnableUnsignedCodeExecutionRequest(web
             throw;
         }
     });
+}
+
+pplx::task<void> ClientConnection::ProcessPairingFileRequest(web::json::value request)
+{
+	std::string udid = StringFromWideString(request[L"udid"].as_string());
+
+	return pplx::create_task([this, udid]() {
+		// Shown on-device in Settings > General > VPN & Device Management.
+		char hostname[256] = {0};
+		gethostname(hostname, sizeof(hostname) - 1);
+		std::string hostName = std::string("AltServer on ") + (strlen(hostname) > 0 ? hostname : "Linux");
+
+		auto pairingFile = DevicePairingManager::instance()->GeneratePairingFile(udid, hostName);
+
+		// Log byte count only; the pairing file contains the private key for this host's pairing.
+		std::cout << "Generated pairing file for device " << udid << " (" << pairingFile.size() << " bytes)." << std::endl;
+
+		auto response = json::value::object();
+		response[L"version"] = json::value::number(1);
+		response[L"identifier"] = json::value::string(L"PairingFileResponse");
+		response[L"pairingFile"] = json::value::string(utility::conversions::to_base64(pairingFile));
+		return this->SendResponse(response);
+	});
 }
 
 web::json::value ClientConnection::ErrorResponse(std::exception& exception)
