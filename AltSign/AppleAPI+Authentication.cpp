@@ -1,5 +1,6 @@
 //  Heavily based on sample code provided by Kabir Oberai (https://github.com/kabiroberai)
 
+#include <cstdlib>
 #include "AppleAPI.hpp"
 
 #include "AnisetteData.h"
@@ -552,6 +553,7 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 				}
 
 				bool isTwoFactorEnabled = false;
+				std::string authTypeString;
 
 				auto authTypeNode = plist_dict_get_item(statusDictionary, "au");
 				if (authTypeNode != nullptr)
@@ -559,10 +561,45 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 					char* authType = nullptr;
 					plist_get_string_val(authTypeNode, &authType);
 
-					if (std::string(authType) == "trustedDeviceSecondaryAuth")
+					if (authType != nullptr)
+					{
+						authTypeString = authType;
+					}
+
+					if (authTypeString == "trustedDeviceSecondaryAuth")
 					{
 						isTwoFactorEnabled = true;
 					}
+				}
+
+				// Since October 2026 Apple often pushes the verification code to trusted devices on its
+				// own as soon as the password is accepted. The response then has hsc 409 and no "au",
+				// which used to fall through to apptokens and fail with -22411. Treat it as trusted-device
+				// 2FA, but do not request another code (that would invalidate the one already shown).
+				// Port of rileytestut/AltSign#59.
+				int64_t hsc = 0;
+				auto hscNode = plist_dict_get_item(statusDictionary, "hsc");
+				if (hscNode != nullptr)
+				{
+					if (plist_get_node_type(hscNode) == PLIST_UINT)
+					{
+						uint64_t value = 0;
+						plist_get_uint_val(hscNode, &value);
+						hsc = (int64_t)value;
+					}
+					else if (plist_get_node_type(hscNode) == PLIST_STRING)
+					{
+						char* value = nullptr;
+						plist_get_string_val(hscNode, &value);
+						if (value != nullptr) hsc = atoi(value);
+					}
+				}
+
+				bool isCodeAlreadySent = authTypeString.empty() && hsc == 409;
+				if (isCodeAlreadySent)
+				{
+					odslog("Apple already sent a verification code to trusted devices (hsc 409).");
+					isTwoFactorEnabled = true;
 				}
 
 				if (isTwoFactorEnabled)
@@ -571,9 +608,10 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 
 					if (verificationHandler.has_value())
 					{
-						return this->RequestTwoFactorCode(adsid, idmsToken, anisetteData, *verificationHandler)
+						return this->RequestTwoFactorCode(adsid, idmsToken, anisetteData, isCodeAlreadySent, *verificationHandler)
 						.then([=](bool success) {
-							return this->Authenticate(appleID, password, anisetteData, std::nullopt);
+							// Sign in again with fresh anisette data: Apple rejects a one-time password that was already used.
+							return this->Authenticate(appleID, password, this->RefreshedAnisetteData(anisetteData), std::nullopt);
 						});
 					}
 					else
@@ -737,10 +775,25 @@ pplx::task<std::string> AppleAPI::FetchAuthToken(std::map<std::string, plist_t> 
 	});
 }
 
+std::shared_ptr<AnisetteData> AppleAPI::RefreshedAnisetteData(std::shared_ptr<AnisetteData> current)
+{
+	if (this->anisetteDataRefreshHandler)
+	{
+		auto fresh = this->anisetteDataRefreshHandler();
+		if (fresh != nullptr)
+		{
+			return fresh;
+		}
+	}
+
+	return current;
+}
+
 pplx::task<bool> AppleAPI::RequestTwoFactorCode(
 	std::string dsid,
 	std::string idmsToken,
 	std::shared_ptr<AnisetteData> anisetteData,
+	bool isCodeAlreadySent,
 	const std::function <pplx::task<std::optional<std::string>>(void)>& verificationHandler)
 {
 	std::wstring url = L"/auth/verify/trusteddevice";
@@ -795,21 +848,34 @@ pplx::task<bool> AppleAPI::RequestTwoFactorCode(
 		request.headers().add(pair.first, pair.second);
 	}
 
-	auto task = this->gsaClient().request(request)
-		.then([=](http_response response)
-			{
-				return response.content_ready();
-			})
-		.then([=](http_response response)
-			{
-				odslog("Received 2FA response status code: " << response.status_code());
-				return response.extract_vector();
-			})
-				.then([=](std::vector<unsigned char> decompressedData)
-					{
-						return verificationHandler();
-					})
-				.then([this, headers](std::optional<std::string> verificationCode) {
+	pplx::task<std::optional<std::string>> codeTask;
+	if (isCodeAlreadySent)
+	{
+		// Asking for another code here would make the one Apple already sent stop working.
+		auto handler = verificationHandler;
+		codeTask = pplx::create_task([]() {}).then([handler]() { return handler(); });
+	}
+	else
+	{
+		auto handler = verificationHandler;
+		codeTask = this->gsaClient().request(request)
+			.then([=](http_response response)
+				{
+					return response.content_ready();
+				})
+			.then([=](http_response response)
+				{
+					odslog("Received 2FA response status code: " << response.status_code());
+					return response.extract_vector();
+				})
+			.then([handler](std::vector<unsigned char> decompressedData)
+				{
+					return handler();
+				});
+	}
+
+	auto task = codeTask
+				.then([this, headers, anisetteData](std::optional<std::string> verificationCode) {
 						if (!verificationCode.has_value())
 						{
 							throw APIError(APIErrorCode::RequiresTwoFactorAuthentication);
@@ -831,6 +897,26 @@ pplx::task<bool> AppleAPI::RequestTwoFactorCode(
 							}
 
 							request.headers().add(pair.first, pair.second);
+						}
+
+						// Typing the code can take longer than the one-time password stays valid.
+						auto fresh = this->RefreshedAnisetteData(anisetteData);
+						if (fresh != anisetteData)
+						{
+							std::map<utility::string_t, utility::string_t> refreshed = {
+								{L"X-Apple-I-MD-M", WideStringFromString(fresh->machineID()) },
+								{L"X-Apple-I-MD", WideStringFromString(fresh->oneTimePassword()) },
+								{L"X-Apple-I-MD-LU", WideStringFromString(fresh->localUserID()) },
+								{L"X-Apple-I-MD-RINFO", WideStringFromString(std::to_string(fresh->routingInfo())) },
+							};
+							for (auto& pair : refreshed)
+							{
+								if (request.headers().has(pair.first))
+								{
+									request.headers().remove(pair.first);
+								}
+								request.headers().add(pair.first, pair.second);
+							}
 						}
 
 						request.headers().add(L"security-code", WideStringFromString(*verificationCode));
@@ -933,6 +1019,14 @@ pplx::task<std::shared_ptr<Account>> AppleAPI::FetchAccount(std::shared_ptr<Appl
 	return task;
 }
 
+// GrandSlam User-Agent. ALTSERVER_GSA_USER_AGENT overrides the default, so it can be
+// matched to the anisette provider (anisette-v3-server reports its own in /v3/client_info).
+static std::string GSAUserAgent()
+{
+	const char* ua = getenv("ALTSERVER_GSA_USER_AGENT");
+	return (ua && *ua) ? std::string(ua) : std::string("AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)");
+}
+
 pplx::task<plist_t> AppleAPI::SendAuthenticationRequest(std::map<std::string, plist_t> requestParameters,
 	std::shared_ptr<AnisetteData> anisetteData)
 {
@@ -964,7 +1058,7 @@ pplx::task<plist_t> AppleAPI::SendAuthenticationRequest(std::map<std::string, pl
 		{L"Content-Type", L"text/x-xml-plist"},
 		{L"X-Mme-Client-Info", WideStringFromString(anisetteData->deviceDescription())},
 		{L"Accept", L"*/*"},
-		{L"User-Agent", L"AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)"}
+		{L"User-Agent", WideStringFromString(GSAUserAgent())}
 	};
 
 	uri_builder builder(U("/grandslam/GsService2"));

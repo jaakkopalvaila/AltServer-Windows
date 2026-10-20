@@ -38,6 +38,10 @@ public:
 		std::string password,
 		std::shared_ptr<AnisetteData> anisetteData,
 		std::optional<std::function <pplx::task<std::optional<std::string>>(void)>> verificationHandler);
+
+	// Optional. When set, authentication fetches fresh anisette data before validating a 2FA code
+	// and before the second sign-in, because Apple rejects one-time passwords that were already used.
+	std::function<std::shared_ptr<AnisetteData>()> anisetteDataRefreshHandler;
     
     // Teams
 	pplx::task<std::vector<std::shared_ptr<Team>>> FetchTeams(std::shared_ptr<Account> account, std::shared_ptr<AppleAPISession> session);
@@ -105,7 +109,10 @@ private:
 		std::string dsid,
 		std::string idmsToken,
 		std::shared_ptr<AnisetteData> anisetteData,
+		bool isCodeAlreadySent,
 		const std::function <pplx::task<std::optional<std::string>>(void)>& verificationHandler);
+
+	std::shared_ptr<AnisetteData> RefreshedAnisetteData(std::shared_ptr<AnisetteData> current);
 
 	template<typename T>
 	T ProcessAnyResponse(plist_t plist, std::string errorCodeKey, std::vector<std::string> errorMessageKeys, std::function<T(plist_t)> parseHandler, std::function<std::optional<APIError>(int64_t)> resultCodeHandler)
